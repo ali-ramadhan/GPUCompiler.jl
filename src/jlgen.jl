@@ -6,7 +6,9 @@ using Core.Compiler: CodeInstance, MethodInstance
 
 struct CodeCache
     dict::Dict{MethodInstance,Vector{CodeInstance}}
-    CodeCache() = new(Dict{MethodInstance,Vector{CodeInstance}}())
+    overrides::Dict{Function,Vector{Function}}
+    CodeCache() = new(Dict{MethodInstance,Vector{CodeInstance}}(),
+                      Dict{Function,Vector{Function}}())
 end
 
 function Base.show(io::IO, ::MIME"text/plain", cc::CodeCache)
@@ -128,12 +130,40 @@ function Core.Compiler.haskey(wvc::WorldView{CodeCache}, mi::MethodInstance)
 end
 
 function Core.Compiler.get(wvc::WorldView{CodeCache}, mi::MethodInstance, default)
+    ft = first(mi.specTypes.parameters)
+    tt = Tuple{mi.specTypes.parameters[2:end]...}
+
+    # check if we have any overrides for this method instance's function
+    # TODO: .instance not valid, but this is just prototying code
+    actual_mi = mi
+    if haskey(wvc.cache.overrides, ft.instance)
+        for f in wvc.cache.overrides[ft.instance]
+            hasmethod(f, tt) || continue
+
+            meth = which(f, tt)
+            sig = Base.signature_type(f, tt)::Type
+            (ti, env) = ccall(:jl_type_intersection_with_env, Any,
+                            (Any, Any), sig, meth.sig)::Core.SimpleVector
+            meth = Base.func_for_method_checked(meth, ti, env)
+            actual_mi = ccall(:jl_specializations_get_linfo, Ref{Core.MethodInstance},
+                (Any, Any, Any, UInt), meth, ti, env, wvc.worlds.min_world)
+            @safe_info "Override call to $mi with $actual_mi"
+            break
+        end
+    end
+
     cache = wvc.cache
-    for ci in get!(cache.dict, mi, CodeInstance[])
+    for ci in get!(cache.dict, actual_mi, CodeInstance[])
         if ci.min_world <= wvc.worlds.min_world && wvc.worlds.max_world <= ci.max_world
             # TODO: if (code && (code == jl_nothing || jl_ir_flag_inferred((jl_array_t*)code)))
             return ci
         end
+    end
+
+    # if we want to override a method instance, eagerly put its replacement in the cache.
+    # FIXME: replace earlier, e.g., by specializing abstract_call?
+    if mi !== actual_mi
+        return ci_cache_populate(actual_mi, wvc.worlds.min_world, wvc.worlds.max_world)
     end
 
     return default
@@ -174,7 +204,7 @@ function ci_cache_populate(mi, min_world, max_world)
         ci.inferred = src
     end
 
-    return
+    return ci
 end
 
 function ci_cache_lookup(mi, min_world, max_world)
